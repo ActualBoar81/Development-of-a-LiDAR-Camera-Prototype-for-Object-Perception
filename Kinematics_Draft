@@ -1,0 +1,749 @@
+"""
+main.py
+
+Prototype logic for camera-grid-assisted 3D LiDAR aiming.
+
+Workflow:
+1. Camera detects blocked grid squares.
+2. Blocked grid cells are clustered into objects.
+3. Each object cluster is converted into an aiming point on the background plane.
+4. Homogeneous transforms convert this point into the LiDAR mount frame.
+5. Inverse kinematics calculates yaw and pitch.
+6. Calibration mapping converts theoretical yaw/pitch into real motor commands.
+7. Arduino receives motor command angles.
+8. LiDAR measures actual distance to the object.
+9. The real 3D object point is reconstructed.
+
+Coordinate convention:
+World/Base frame {W}:
+    X_w: right
+    Y_w: forward toward background
+    Z_w: up
+
+Background plane:
+    Located at Y_w = background_distance_m
+
+Mount frame {M}:
+    Usually same as world frame, unless the pan/tilt base is offset/rotated.
+
+Pan-tilt convention:
+    yaw = 0 means looking straight toward +Y
+    positive yaw turns toward +X
+    positive pitch turns upward toward +Z
+
+Mechanical calibration:
+    At theoretical home:
+        yaw_kinematic = 0 deg
+        pitch_kinematic = 0 deg
+
+    Actual motor home:
+        yaw_motor = 49 deg
+        pitch_motor = 55 deg
+"""
+
+import math
+import time
+from dataclasses import dataclass
+from typing import List, Tuple, Set
+from collections import deque
+
+import numpy as np
+
+
+# ============================================================
+# Data structures
+# ============================================================
+
+@dataclass
+class Vec3:
+    x: float
+    y: float
+    z: float
+
+
+@dataclass
+class GridConfig:
+    rows: int
+    cols: int
+    square_size_m: float
+    origin_at_center: bool = True
+
+
+@dataclass
+class SystemGeometry:
+    background_distance_m: float
+    T_WB: np.ndarray  # Transform from background frame to world frame
+    T_WM: np.ndarray  # Transform from mount frame to world frame
+
+
+@dataclass
+class CalibrationConfig:
+    yaw_home_deg: float = 49.0
+    pitch_home_deg: float = 55.0
+
+    yaw_sign: float = 1.0
+    pitch_sign: float = 1.0
+
+    yaw_scale: float = 1.0
+    pitch_scale: float = 1.0
+
+    yaw_min_deg: float = 0.0
+    yaw_max_deg: float = 180.0
+    pitch_min_deg: float = 0.0
+    pitch_max_deg: float = 180.0
+
+
+@dataclass
+class ObjectResult:
+    object_id: int
+    blocked_cells: List[Tuple[int, int]]
+    aim_point_B: np.ndarray
+    aim_point_W: np.ndarray
+    aim_point_M: np.ndarray
+    yaw_kin_deg: float
+    pitch_kin_deg: float
+    yaw_motor_deg: float
+    pitch_motor_deg: float
+    measured_distance_m: float
+    reconstructed_point_W: np.ndarray
+
+
+# ============================================================
+# Homogeneous transformation utilities
+# ============================================================
+
+def T_from_R_p(R: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """
+    Builds a 4x4 homogeneous transformation matrix from rotation R and position p.
+    """
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = p
+    return T
+
+
+def inverse_transform(T: np.ndarray) -> np.ndarray:
+    """
+    Inverts a homogeneous transformation matrix.
+    """
+    R = T[:3, :3]
+    p = T[:3, 3]
+
+    T_inv = np.eye(4)
+    T_inv[:3, :3] = R.T
+    T_inv[:3, 3] = -R.T @ p
+
+    return T_inv
+
+
+def Rx(theta_rad: float) -> np.ndarray:
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+
+    return np.array([
+        [1, 0,  0],
+        [0, c, -s],
+        [0, s,  c]
+    ])
+
+
+def Ry(theta_rad: float) -> np.ndarray:
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+
+    return np.array([
+        [ c, 0, s],
+        [ 0, 1, 0],
+        [-s, 0, c]
+    ])
+
+
+def Rz(theta_rad: float) -> np.ndarray:
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+
+    return np.array([
+        [c, -s, 0],
+        [s,  c, 0],
+        [0,  0, 1]
+    ])
+
+
+# ============================================================
+# Grid mapping
+# ============================================================
+
+def grid_cell_to_background_point(
+    row: int,
+    col: int,
+    grid: GridConfig
+) -> np.ndarray:
+    """
+    Converts one blocked grid cell into a point in the background frame.
+
+    Background frame {B}:
+        x_B = horizontal coordinate on background
+        y_B = vertical coordinate on background
+        z_B = 0, because the point lies on the background plane
+
+    Later, T_WB moves this point into world frame.
+
+    Note:
+        Here y_B means vertical coordinate inside the background plane.
+        This is not the same as world Y.
+    """
+
+    if grid.origin_at_center:
+        x_B = (col - (grid.cols - 1) / 2.0) * grid.square_size_m
+        y_B = ((grid.rows - 1) / 2.0 - row) * grid.square_size_m
+    else:
+        x_B = col * grid.square_size_m
+        y_B = -row * grid.square_size_m
+
+    z_B = 0.0
+
+    return np.array([x_B, y_B, z_B, 1.0])
+
+
+def average_cluster_to_background_point(
+    cluster: List[Tuple[int, int]],
+    grid: GridConfig
+) -> np.ndarray:
+    """
+    Converts a cluster of blocked grid cells into one average aiming point.
+    """
+
+    if not cluster:
+        raise ValueError("Empty cluster cannot be converted to aiming point.")
+
+    points_B = [
+        grid_cell_to_background_point(row, col, grid)
+        for row, col in cluster
+    ]
+
+    average_point_B = sum(points_B) / len(points_B)
+    average_point_B[3] = 1.0
+
+    return average_point_B
+
+
+# ============================================================
+# Blocked-cell clustering
+# ============================================================
+
+def cluster_blocked_cells(
+    blocked_cells: List[Tuple[int, int]]
+) -> List[List[Tuple[int, int]]]:
+    """
+    Groups neighboring blocked cells into object clusters.
+
+    This is useful if YOLO/object grouping is not ready yet.
+    If your groupmate's code already gives separate objects, you may skip this.
+    """
+
+    blocked_set: Set[Tuple[int, int]] = set(blocked_cells)
+    visited: Set[Tuple[int, int]] = set()
+    clusters: List[List[Tuple[int, int]]] = []
+
+    neighbor_offsets = [
+        (-1, 0), (1, 0),
+        (0, -1), (0, 1),
+        (-1, -1), (-1, 1),
+        (1, -1), (1, 1)
+    ]
+
+    for cell in blocked_set:
+        if cell in visited:
+            continue
+
+        cluster = []
+        queue = deque([cell])
+        visited.add(cell)
+
+        while queue:
+            current = queue.popleft()
+            cluster.append(current)
+
+            r, c = current
+
+            for dr, dc in neighbor_offsets:
+                neighbor = (r + dr, c + dc)
+
+                if neighbor in blocked_set and neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        clusters.append(cluster)
+
+    return clusters
+
+
+# ============================================================
+# Inverse kinematics
+# ============================================================
+
+def pan_tilt_ik_from_target_world(
+    aim_point_W: np.ndarray,
+    T_WM: np.ndarray
+) -> Tuple[float, float, np.ndarray]:
+    """
+    Calculates yaw and pitch needed to aim at aim_point_W.
+
+    The target is first transformed into the mount frame {M}.
+    Then yaw and pitch are calculated there.
+
+    Mount frame convention:
+        +Y_M = forward
+        +X_M = right
+        +Z_M = up
+    """
+
+    T_MW = inverse_transform(T_WM)
+    aim_point_M = T_MW @ aim_point_W
+
+    x = aim_point_M[0]
+    y = aim_point_M[1]
+    z = aim_point_M[2]
+
+    yaw_rad = math.atan2(x, y)
+
+    horizontal_distance = math.sqrt(x**2 + y**2)
+    pitch_rad = math.atan2(z, horizontal_distance)
+
+    return yaw_rad, pitch_rad, aim_point_M
+
+
+def beam_direction_from_yaw_pitch(
+    yaw_rad: float,
+    pitch_rad: float
+) -> np.ndarray:
+    """
+    Returns the unit vector of the LiDAR beam in the mount frame.
+
+    Convention:
+        yaw = rotation around +Z
+        pitch = upward/downward angle
+        initial beam direction = +Y
+    """
+
+    beam_M = np.array([
+        math.sin(yaw_rad) * math.cos(pitch_rad),
+        math.cos(yaw_rad) * math.cos(pitch_rad),
+        math.sin(pitch_rad)
+    ])
+
+    return beam_M / np.linalg.norm(beam_M)
+
+
+def reconstruct_object_point_world(
+    measured_distance_m: float,
+    yaw_rad: float,
+    pitch_rad: float,
+    T_WM: np.ndarray
+) -> np.ndarray:
+    """
+    Reconstructs actual object point in world frame after LiDAR measurement.
+
+    The aiming point is on the background plane.
+    The measured point is closer, on the same beam direction.
+    """
+
+    beam_M = beam_direction_from_yaw_pitch(yaw_rad, pitch_rad)
+
+    object_point_M = np.array([
+        measured_distance_m * beam_M[0],
+        measured_distance_m * beam_M[1],
+        measured_distance_m * beam_M[2],
+        1.0
+    ])
+
+    object_point_W = T_WM @ object_point_M
+
+    return object_point_W
+
+
+# ============================================================
+# Calibration mapping
+# ============================================================
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def map_kinematic_to_motor_angles(
+    yaw_kin_deg: float,
+    pitch_kin_deg: float,
+    calibration: CalibrationConfig
+) -> Tuple[float, float]:
+    """
+    Converts theoretical kinematic angles into real motor command angles.
+
+    Example:
+        yaw_kin = 0 deg, pitch_kin = 0 deg
+        becomes:
+        yaw_motor = 49 deg, pitch_motor = 55 deg
+    """
+
+    yaw_motor_deg = (
+        calibration.yaw_home_deg
+        + calibration.yaw_sign * calibration.yaw_scale * yaw_kin_deg
+    )
+
+    pitch_motor_deg = (
+        calibration.pitch_home_deg
+        + calibration.pitch_sign * calibration.pitch_scale * pitch_kin_deg
+    )
+
+    yaw_motor_deg = clamp(
+        yaw_motor_deg,
+        calibration.yaw_min_deg,
+        calibration.yaw_max_deg
+    )
+
+    pitch_motor_deg = clamp(
+        pitch_motor_deg,
+        calibration.pitch_min_deg,
+        calibration.pitch_max_deg
+    )
+
+    return yaw_motor_deg, pitch_motor_deg
+
+
+# ============================================================
+# Arduino / LiDAR placeholders
+# ============================================================
+
+def send_motor_angles_to_arduino(
+    yaw_motor_deg: float,
+    pitch_motor_deg: float
+) -> None:
+    """
+    Placeholder for Arduino communication.
+
+    Later you can replace this with serial communication.
+
+    Example serial message:
+        Y49.00 P55.00
+    """
+
+    command = f"Y{yaw_motor_deg:.2f} P{pitch_motor_deg:.2f}"
+    print(f"[Arduino command] {command}")
+
+    # Example real implementation later:
+    #
+    # import serial
+    # arduino = serial.Serial("/dev/ttyACM0", 115200, timeout=1)
+    # arduino.write((command + "\n").encode("utf-8"))
+
+
+def wait_until_motors_reach_position() -> None:
+    """
+    Placeholder delay.
+
+    Replace with feedback or a better wait strategy if available.
+    """
+
+    time.sleep(0.5)
+
+
+def read_lidar_distance_m() -> float:
+    """
+    Placeholder LiDAR reading.
+
+    Replace this with your actual TFmini / ToF readout.
+
+    For professor demonstration, this simulated value means:
+        the object is 1.35 m away along the aimed LiDAR beam.
+    """
+
+    simulated_distance_m = 1.35
+    return simulated_distance_m
+
+
+# ============================================================
+# Temporary camera/grid input placeholder
+# ============================================================
+
+def get_blocked_cells_from_camera_demo() -> List[Tuple[int, int]]:
+    """
+    Temporary replacement for your groupmate's detection output.
+
+    This simulates two objects blocking different parts of the background grid.
+
+    Grid indexing:
+        row = 0 is top row
+        col = 0 is left column
+    """
+
+    blocked_cells = [
+        # Object 1, near center-right
+        (9, 10),
+        (9, 11),
+        (10, 10),
+        (10, 11),
+
+        # Object 2, upper-left
+        (5, 5),
+        (5, 6),
+        (6, 5),
+        (6, 6),
+        (6, 7)
+    ]
+
+    return blocked_cells
+
+
+# ============================================================
+# Main processing function
+# ============================================================
+
+def process_detected_objects(
+    blocked_cells: List[Tuple[int, int]],
+    grid: GridConfig,
+    geometry: SystemGeometry,
+    calibration: CalibrationConfig
+) -> List[ObjectResult]:
+    """
+    Full pipeline from blocked grid cells to motor commands and 3D points.
+    """
+
+    clusters = cluster_blocked_cells(blocked_cells)
+
+    results: List[ObjectResult] = []
+
+    for object_id, cluster in enumerate(clusters, start=1):
+
+        # 1. Cluster center in background frame
+        aim_point_B = average_cluster_to_background_point(cluster, grid)
+
+        # 2. Background frame to world frame
+        aim_point_W = geometry.T_WB @ aim_point_B
+
+        # 3. Inverse kinematics
+        yaw_rad, pitch_rad, aim_point_M = pan_tilt_ik_from_target_world(
+            aim_point_W,
+            geometry.T_WM
+        )
+
+        yaw_kin_deg = math.degrees(yaw_rad)
+        pitch_kin_deg = math.degrees(pitch_rad)
+
+        # 4. Mechanical calibration mapping
+        yaw_motor_deg, pitch_motor_deg = map_kinematic_to_motor_angles(
+            yaw_kin_deg,
+            pitch_kin_deg,
+            calibration
+        )
+
+        # 5. Send motor command
+        send_motor_angles_to_arduino(
+            yaw_motor_deg,
+            pitch_motor_deg
+        )
+
+        # 6. Wait until motors move
+        wait_until_motors_reach_position()
+
+        # 7. Read LiDAR distance
+        measured_distance_m = read_lidar_distance_m()
+
+        # 8. Reconstruct actual object point
+        object_point_W = reconstruct_object_point_world(
+            measured_distance_m,
+            yaw_rad,
+            pitch_rad,
+            geometry.T_WM
+        )
+
+        result = ObjectResult(
+            object_id=object_id,
+            blocked_cells=cluster,
+            aim_point_B=aim_point_B,
+            aim_point_W=aim_point_W,
+            aim_point_M=aim_point_M,
+            yaw_kin_deg=yaw_kin_deg,
+            pitch_kin_deg=pitch_kin_deg,
+            yaw_motor_deg=yaw_motor_deg,
+            pitch_motor_deg=pitch_motor_deg,
+            measured_distance_m=measured_distance_m,
+            reconstructed_point_W=object_point_W
+        )
+
+        results.append(result)
+
+    return results
+
+
+# ============================================================
+# Printing / demonstration output
+# ============================================================
+
+def print_result(result: ObjectResult) -> None:
+    print("\n" + "=" * 60)
+    print(f"Object {result.object_id}")
+    print("=" * 60)
+
+    print(f"Blocked cells: {result.blocked_cells}")
+
+    print("\nAiming point on background frame {B}:")
+    print(f"x_B = {result.aim_point_B[0]: .3f} m")
+    print(f"y_B = {result.aim_point_B[1]: .3f} m")
+    print(f"z_B = {result.aim_point_B[2]: .3f} m")
+
+    print("\nAiming point in world frame {W}:")
+    print(f"x_W = {result.aim_point_W[0]: .3f} m")
+    print(f"y_W = {result.aim_point_W[1]: .3f} m")
+    print(f"z_W = {result.aim_point_W[2]: .3f} m")
+
+    print("\nAiming point in mount frame {M}:")
+    print(f"x_M = {result.aim_point_M[0]: .3f} m")
+    print(f"y_M = {result.aim_point_M[1]: .3f} m")
+    print(f"z_M = {result.aim_point_M[2]: .3f} m")
+
+    print("\nInverse kinematics angles:")
+    print(f"yaw_kinematic   = {result.yaw_kin_deg: .2f} deg")
+    print(f"pitch_kinematic = {result.pitch_kin_deg: .2f} deg")
+
+    print("\nMapped motor angles:")
+    print(f"yaw_motor   = {result.yaw_motor_deg: .2f} deg")
+    print(f"pitch_motor = {result.pitch_motor_deg: .2f} deg")
+
+    print("\nLiDAR measurement:")
+    print(f"distance = {result.measured_distance_m: .3f} m")
+
+    print("\nReconstructed real object point in world frame {W}:")
+    print(f"x_object_W = {result.reconstructed_point_W[0]: .3f} m")
+    print(f"y_object_W = {result.reconstructed_point_W[1]: .3f} m")
+    print(f"z_object_W = {result.reconstructed_point_W[2]: .3f} m")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    print("Camera-grid-assisted 3D LiDAR aiming prototype")
+    print("Single-file demonstrator\n")
+
+    # ------------------------------------------------------------
+    # 1. System configuration
+    # ------------------------------------------------------------
+
+    grid = GridConfig(
+        rows=20,
+        cols=20,
+        square_size_m=0.03,   # 30 mm square size
+        origin_at_center=True
+    )
+
+    # This should later come from startup LiDAR measurement.
+    background_distance_m = 2.0
+
+    # Background frame {B} to world frame {W}
+    #
+    # Background frame:
+    #   x_B = horizontal grid coordinate
+    #   y_B = vertical grid coordinate
+    #   z_B = 0 on plane
+    #
+    # World frame:
+    #   x_W = right
+    #   y_W = forward
+    #   z_W = up
+    #
+    # Therefore:
+    #   x_W = x_B
+    #   y_W = background_distance
+    #   z_W = y_B
+    #
+    # Rotation columns describe where B axes appear in W:
+    #   B x-axis maps to W x-axis: [1, 0, 0]
+    #   B y-axis maps to W z-axis: [0, 0, 1]
+    #   B z-axis maps to W y-axis: [0, 1, 0]
+    R_WB = np.array([
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 1, 0]
+    ])
+
+    p_WB = np.array([
+        0.0,
+        background_distance_m,
+        0.0
+    ])
+
+    T_WB = T_from_R_p(R_WB, p_WB)
+
+    # Mount frame {M} to world frame {W}
+    #
+    # For first prototype, assume mount frame is equal to world frame.
+    # If the mount is physically shifted, add its position here.
+    #
+    # Example offset:
+    #   p_WM = np.array([0.02, 0.00, 0.04])
+    #
+    # For now:
+    T_WM = np.eye(4)
+
+    geometry = SystemGeometry(
+        background_distance_m=background_distance_m,
+        T_WB=T_WB,
+        T_WM=T_WM
+    )
+
+    # ------------------------------------------------------------
+    # 2. Calibration
+    # ------------------------------------------------------------
+
+    calibration = CalibrationConfig(
+        yaw_home_deg=49.0,
+        pitch_home_deg=55.0,
+
+        # Change these to -1 if motor moves opposite direction.
+        yaw_sign=1.0,
+        pitch_sign=1.0,
+
+        # Use scale factors only if edge positions are inaccurate.
+        yaw_scale=1.0,
+        pitch_scale=1.0,
+
+        yaw_min_deg=0.0,
+        yaw_max_deg=180.0,
+        pitch_min_deg=0.0,
+        pitch_max_deg=180.0
+    )
+
+    print("Calibration:")
+    print(f"Home yaw motor angle   = {calibration.yaw_home_deg} deg")
+    print(f"Home pitch motor angle = {calibration.pitch_home_deg} deg")
+
+    # ------------------------------------------------------------
+    # 3. Temporary camera/grid detection
+    # ------------------------------------------------------------
+
+    blocked_cells = get_blocked_cells_from_camera_demo()
+
+    print("\nDetected blocked grid cells:")
+    print(blocked_cells)
+
+    # ------------------------------------------------------------
+    # 4. Process objects
+    # ------------------------------------------------------------
+
+    results = process_detected_objects(
+        blocked_cells=blocked_cells,
+        grid=grid,
+        geometry=geometry,
+        calibration=calibration
+    )
+
+    # ------------------------------------------------------------
+    # 5. Print results
+    # ------------------------------------------------------------
+
+    for result in results:
+        print_result(result)
+
+
+if __name__ == "__main__":
+    main()
