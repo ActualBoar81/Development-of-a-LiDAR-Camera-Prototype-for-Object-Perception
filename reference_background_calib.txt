@@ -1,0 +1,208 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CHECKERBOARD = (8, 6)
+SQUARE_SIZE = 0.025   # 2.5 cm (CHANGE IF NEEDED)
+
+MODEL_PATH = "yolov8n.onnx"
+
+latest_data = []
+H = None
+
+# -----------------------------
+# YOLO MODEL
+# -----------------------------
+session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+# -----------------------------
+# COCO CLASSES
+# -----------------------------
+classes = [
+    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
+    "chair","sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop",
+    "mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink",
+    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"
+]
+
+# -----------------------------
+# CAMERA
+# -----------------------------
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# -----------------------------
+# PREPROCESS
+# -----------------------------
+def preprocess(frame):
+    img = cv2.resize(frame, (640, 640))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return np.expand_dims(img, axis=0)
+
+# -----------------------------
+# CHECKERBOARD HOMOGRAPHY (REAL WORLD)
+# -----------------------------
+def get_homography(gray):
+
+    found, corners = cv2.findChessboardCorners(gray, CHECKERBOARD)
+
+    if not found:
+        return None, False
+
+    corners = cv2.cornerSubPix(
+        gray, corners,
+        (11, 11),
+        (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    )
+
+    cols, rows = CHECKERBOARD
+
+    src = np.array([
+        corners[0][0],
+        corners[cols - 1][0],
+        corners[-1][0],
+        corners[-cols][0]
+    ], dtype=np.float32)
+
+    # REAL WORLD COORDINATES (meters)
+    dst = np.array([
+        [0, 0],
+        [(cols - 1) * SQUARE_SIZE, 0],
+        [(cols - 1) * SQUARE_SIZE, (rows - 1) * SQUARE_SIZE],
+        [0, (rows - 1) * SQUARE_SIZE]
+    ], dtype=np.float32)
+
+    H, _ = cv2.findHomography(src, dst)
+
+    return H, True
+
+# -----------------------------
+# POSTPROCESS (ROBUST YOLO)
+# -----------------------------
+def postprocess(outputs, frame, H):
+
+    global latest_data
+
+    h, w = frame.shape[:2]
+    preds = np.squeeze(outputs[0])
+
+    if preds.shape[0] < preds.shape[1]:
+        preds = preds.T
+
+    results = []
+
+    for det in preds:
+
+        x, y, bw, bh = det[:4]
+        cls_scores = det[4:]
+
+        cls_id = np.argmax(cls_scores)
+        conf = cls_scores[cls_id]
+
+        if conf < 0.3:
+            continue
+
+        # scale from 640 model space
+        x1 = int((x - bw / 2) * w / 640)
+        y1 = int((y - bh / 2) * h / 640)
+        x2 = int((x + bw / 2) * w / 640)
+        y2 = int((y + bh / 2) * h / 640)
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        world_x, world_y = None, None
+
+        if H is not None:
+            try:
+                p = np.array([[[cx, cy]]], dtype=np.float32)
+                mapped = cv2.perspectiveTransform(p, H)
+                world_x = float(mapped[0][0][0])
+                world_y = float(mapped[0][0][1])
+            except:
+                pass
+
+        # DRAW
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+
+        label = f"{classes[cls_id]} {conf:.2f}"
+        cv2.putText(frame, label, (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        if world_x is not None:
+            cv2.putText(frame,
+                        f"W({world_x:.2f},{world_y:.2f})m",
+                        (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255,0,0), 2)
+
+        results.append({
+            "class": classes[cls_id],
+            "confidence": float(conf),
+            "pixel": [cx, cy],
+            "world_m": [world_x, world_y]
+        })
+
+    latest_data = results
+    return frame
+
+# -----------------------------
+# FLASK APP
+# -----------------------------
+app = Flask(__name__)
+
+def generate():
+
+    global H
+
+    while True:
+
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        H, _ = get_homography(gray)
+
+        inp = preprocess(frame)
+        outputs = session.run(None, {input_name: inp})
+
+        frame = postprocess(outputs, frame, H)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        frame_bytes = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' +
+               frame_bytes + b'\r\n')
+
+@app.route('/')
+def video():
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/data')
+def data():
+    return jsonify(latest_data)
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    print("Open: http://<PI_IP>:5000")
+    app.run(host="0.0.0.0", port=5000)
