@@ -1,0 +1,462 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+import serial
+import time
+import math
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CHECKERBOARD = (8, 6)
+SQUARE_SIZE = 0.025  # 2.5 cm
+
+MODEL_PATH = "yolov8n.onnx"
+
+# World frame:
+# X = horizontal on background
+# Y = perpendicular/depth toward background
+# Z = vertical
+CAMERA_POS_W_M = np.array([0.09, 0.05, 0.10])  # documented; homography handles camera view
+LIDAR_POS_W_M = np.array([0.00, 0.00, 0.09])   # used directly in IK
+
+BACKGROUND_DISTANCE_M = 2.0  # background plane distance along world +Y
+
+YAW_HOME_DEG = 49.0
+PITCH_HOME_DEG = 55.0
+
+YAW_SIGN = 1.0      # change to -1 if yaw moves opposite
+PITCH_SIGN = 1.0    # change to -1 if pitch moves opposite
+
+MEASURE_ALL_OBJECTS = False  # first test: False; later: True
+
+ARDUINO_PORT = "/dev/ttyUSB0"
+BAUDRATE = 115200
+
+CONF_THRESHOLD = 0.3
+
+latest_data = []
+H = None
+arduino = None
+
+# -----------------------------
+# COCO CLASSES
+# -----------------------------
+classes = [
+    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
+    "chair","sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop",
+    "mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink",
+    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"
+]
+
+# -----------------------------
+# ARDUINO
+# -----------------------------
+def init_arduino():
+    global arduino
+    arduino = serial.Serial(ARDUINO_PORT, BAUDRATE, timeout=2)
+    time.sleep(2)
+    ready = arduino.readline().decode(errors="ignore").strip()
+    print("[Arduino]", ready)
+
+
+def send_angle_and_read_distance(yaw_deg, pitch_deg):
+    if arduino is None:
+        return None
+
+    yaw_i = round(yaw_deg)
+    pitch_i = round(pitch_deg)
+
+    command = f"ANGLE,{yaw_i},{pitch_i}\n"
+    print("[Pi -> Arduino]", command.strip())
+    arduino.write(command.encode())
+
+    response = arduino.readline().decode(errors="ignore").strip()
+    print("[Arduino -> Pi]", response)
+
+    if response.startswith("DIST"):
+        distance_raw = float(response.split(",")[1])
+
+        # Assumption: Arduino sends centimeters.
+        # If Arduino sends mm, use distance_raw / 1000.0
+        return distance_raw / 100.0
+
+    return None
+
+
+# -----------------------------
+# KINEMATICS
+# -----------------------------
+def clamp(v, vmin, vmax):
+    return max(vmin, min(vmax, v))
+
+
+def calculate_yaw_pitch_from_world(world_x, world_z, background_distance_m):
+    """
+    Aim point is on background plane:
+        P_target = [world_x, background_distance_m, world_z]
+
+    LiDAR origin:
+        LIDAR_POS_W_M = [0, 0, 0.09]
+
+    Direction:
+        target - lidar_origin
+    """
+
+    target_W = np.array([
+        world_x,
+        background_distance_m,
+        world_z
+    ])
+
+    direction = target_W - LIDAR_POS_W_M
+
+    dx = direction[0]
+    dy = direction[1]
+    dz = direction[2]
+
+    yaw_rad = math.atan2(dx, dy)
+    horizontal_distance = math.sqrt(dx**2 + dy**2)
+    pitch_rad = math.atan2(dz, horizontal_distance)
+
+    return math.degrees(yaw_rad), math.degrees(pitch_rad)
+
+
+def map_to_motor_angles(yaw_kin_deg, pitch_kin_deg):
+    yaw_motor = YAW_HOME_DEG + YAW_SIGN * yaw_kin_deg
+    pitch_motor = PITCH_HOME_DEG + PITCH_SIGN * pitch_kin_deg
+
+    yaw_motor = clamp(yaw_motor, 0, 180)
+    pitch_motor = clamp(pitch_motor, 0, 180)
+
+    return yaw_motor, pitch_motor
+
+
+def reconstruct_object_point(distance_m, yaw_kin_deg, pitch_kin_deg):
+    """
+    Reconstruct actual object point from LiDAR origin.
+    """
+
+    yaw = math.radians(yaw_kin_deg)
+    pitch = math.radians(pitch_kin_deg)
+
+    beam_W = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.cos(yaw) * math.cos(pitch),
+        math.sin(pitch)
+    ])
+
+    object_W = LIDAR_POS_W_M + distance_m * beam_W
+
+    return object_W.tolist()
+
+
+# -----------------------------
+# YOLO MODEL
+# -----------------------------
+session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+# -----------------------------
+# CAMERA
+# -----------------------------
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# -----------------------------
+# IMAGE PROCESSING
+# -----------------------------
+def preprocess(frame):
+    img = cv2.resize(frame, (640, 640))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return np.expand_dims(img, axis=0)
+
+
+def get_homography(gray):
+    found, corners = cv2.findChessboardCorners(gray, CHECKERBOARD)
+
+    if not found:
+        return None, False
+
+    corners = cv2.cornerSubPix(
+        gray,
+        corners,
+        (11, 11),
+        (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    )
+
+    cols, rows = CHECKERBOARD
+
+    src = np.array([
+        corners[0][0],
+        corners[cols - 1][0],
+        corners[-1][0],
+        corners[-cols][0]
+    ], dtype=np.float32)
+
+    dst = np.array([
+        [0, 0],
+        [(cols - 1) * SQUARE_SIZE, 0],
+        [(cols - 1) * SQUARE_SIZE, (rows - 1) * SQUARE_SIZE],
+        [0, (rows - 1) * SQUARE_SIZE]
+    ], dtype=np.float32)
+
+    H, _ = cv2.findHomography(src, dst)
+    return H, True
+
+
+def postprocess(outputs, frame, H):
+    global latest_data
+
+    h, w = frame.shape[:2]
+    preds = np.squeeze(outputs[0])
+
+    if preds.shape[0] < preds.shape[1]:
+        preds = preds.T
+
+    results = []
+
+    board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE
+    board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE
+
+    for det in preds:
+        x, y, bw, bh = det[:4]
+        cls_scores = det[4:]
+
+        cls_id = int(np.argmax(cls_scores))
+        conf = float(cls_scores[cls_id])
+
+        if conf < CONF_THRESHOLD:
+            continue
+
+        x1 = int((x - bw / 2) * w / 640)
+        y1 = int((y - bh / 2) * h / 640)
+        x2 = int((x + bw / 2) * w / 640)
+        y2 = int((y + bh / 2) * h / 640)
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        world_x = None
+        world_z = None
+        yaw_motor = None
+        pitch_motor = None
+
+        if H is not None:
+            try:
+                p = np.array([[[cx, cy]]], dtype=np.float32)
+                mapped = cv2.perspectiveTransform(p, H)
+
+                board_x = float(mapped[0][0][0])
+                board_y = float(mapped[0][0][1])
+
+                # Convert checkerboard top-left origin to world-centered X/Z.
+                world_x = board_x - board_width / 2.0
+                world_z = board_height / 2.0 - board_y
+
+                yaw_kin, pitch_kin = calculate_yaw_pitch_from_world(
+                    world_x,
+                    world_z,
+                    BACKGROUND_DISTANCE_M
+                )
+
+                yaw_motor, pitch_motor = map_to_motor_angles(
+                    yaw_kin,
+                    pitch_kin
+                )
+
+            except Exception:
+                pass
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        label = f"{classes[cls_id]} {conf:.2f}"
+        cv2.putText(
+            frame,
+            label,
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2
+        )
+
+        if world_x is not None:
+            cv2.putText(
+                frame,
+                f"W({world_x:.2f},{world_z:.2f}) Y:{yaw_motor:.1f} P:{pitch_motor:.1f}",
+                (x1, y2 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 0, 0),
+                2
+            )
+
+        results.append({
+            "class": classes[cls_id],
+            "confidence": conf,
+            "pixel": [cx, cy],
+            "world_m": [world_x, world_z],
+            "motor_preview_deg": [yaw_motor, pitch_motor]
+        })
+
+    latest_data = results
+    return frame
+
+
+# -----------------------------
+# FLASK
+# -----------------------------
+app = Flask(__name__)
+
+
+def generate():
+    global H
+
+    while True:
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        H, _ = get_homography(gray)
+
+        inp = preprocess(frame)
+        outputs = session.run(None, {input_name: inp})
+
+        frame = postprocess(outputs, frame, H)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        frame_bytes = buffer.tobytes()
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            frame_bytes +
+            b"\r\n"
+        )
+
+
+@app.route("/")
+def video():
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/data")
+def data():
+    return jsonify(latest_data)
+
+
+@app.route("/scan")
+def scan():
+    """
+    One-time measurement.
+
+    If MEASURE_ALL_OBJECTS = False:
+        measures only first detected object.
+
+    If MEASURE_ALL_OBJECTS = True:
+        measures all detected objects once, in detected order.
+    """
+
+    if len(latest_data) == 0:
+        return jsonify({"error": "No object detected"})
+
+    if MEASURE_ALL_OBJECTS:
+        objects_to_scan = latest_data.copy()
+    else:
+        objects_to_scan = [latest_data[0]]
+
+    scan_results = []
+
+    for index, obj in enumerate(objects_to_scan, start=1):
+        world_x = obj["world_m"][0]
+        world_z = obj["world_m"][1]
+
+        if world_x is None or world_z is None:
+            scan_results.append({
+                "object_index": index,
+                "error": "No world coordinate. Checkerboard not detected."
+            })
+            continue
+
+        yaw_kin, pitch_kin = calculate_yaw_pitch_from_world(
+            world_x,
+            world_z,
+            BACKGROUND_DISTANCE_M
+        )
+
+        yaw_motor, pitch_motor = map_to_motor_angles(
+            yaw_kin,
+            pitch_kin
+        )
+
+        distance_m = send_angle_and_read_distance(
+            yaw_motor,
+            pitch_motor
+        )
+
+        if distance_m is None:
+            scan_results.append({
+                "object_index": index,
+                "error": "No valid distance received from Arduino"
+            })
+            continue
+
+        point_3d = reconstruct_object_point(
+            distance_m,
+            yaw_kin,
+            pitch_kin
+        )
+
+        scan_results.append({
+            "object_index": index,
+            "object": obj["class"],
+            "confidence": obj["confidence"],
+            "world_aim_point_m": [
+                world_x,
+                BACKGROUND_DISTANCE_M,
+                world_z
+            ],
+            "yaw_kinematic_deg": yaw_kin,
+            "pitch_kinematic_deg": pitch_kin,
+            "yaw_motor_deg": yaw_motor,
+            "pitch_motor_deg": pitch_motor,
+            "distance_m": distance_m,
+            "reconstructed_3d_point_m": point_3d
+        })
+
+    return jsonify({
+        "scan_mode": "all_objects_once" if MEASURE_ALL_OBJECTS else "single_object_once",
+        "number_of_scanned_objects": len(scan_results),
+        "results": scan_results
+    })
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    print("Starting system...")
+    print("Camera position W:", CAMERA_POS_W_M)
+    print("LiDAR position W:", LIDAR_POS_W_M)
+
+    init_arduino()
+
+    print("Open video stream: http://<PI_IP>:5000")
+    print("Trigger scan:      http://<PI_IP>:5000/scan")
+
+    app.run(host="0.0.0.0", port=5000)
