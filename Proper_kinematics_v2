@@ -174,29 +174,23 @@ def clamp(v, vmin, vmax):
 
 
 def background_xy_to_background_point(X, Y):
-    """
-    Homography gives X,Y on the background plane.
-
-    If homography output is top-left based:
-        convert it to centered background coordinates.
-
-    If homography output is already centered:
-        use directly.
-    """
-
     X = X * HOMOGRAPHY_OUTPUT_SCALE_TO_M
     Y = Y * HOMOGRAPHY_OUTPUT_SCALE_TO_M
 
-    if HOMOGRAPHY_OUTPUT_IS_CENTERED:
-        x_B = X
-        y_B = Y
-    else:
-        board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
-        board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
+    board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
+    board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
 
-        x_B = X - board_width / 2.0
-        y_B = board_height / 2.0 - Y
+    FLIP_X = True
+    FLIP_Y = True
 
+    if FLIP_X:
+        X = board_width - X
+
+    if FLIP_Y:
+        Y = board_height - Y
+
+    x_B = X
+    y_B = Y
     z_B = 0.0
 
     return np.array([x_B, y_B, z_B, 1.0])
