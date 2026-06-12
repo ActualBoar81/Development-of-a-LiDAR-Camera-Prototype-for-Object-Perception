@@ -1,0 +1,210 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+
+# =========================
+# CONFIG
+# =========================
+MODEL_PATH = "yolov8n.onnx"
+HOMOGRAPHY_PATH = "homography.npy"
+CONF_THRES = 0.25
+
+latest = []
+
+# =========================
+# LOAD HOMOGRAPHY
+# =========================
+H = np.load(HOMOGRAPHY_PATH)
+
+# =========================
+# COCO CLASSES
+# =========================
+classes = [
+"person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
+"traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+"dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+"umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+"kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+"bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+"sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
+"chair","sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop",
+"mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink",
+"refrigerator","book","clock","vase","scissors","teddy bear","hair_drier","toothbrush"
+]
+
+# =========================
+# MODEL
+# =========================
+session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+# =========================
+# CAMERA
+# =========================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# =========================
+# PREPROCESS
+# =========================
+def preprocess(frame):
+    img = cv2.resize(frame, (640, 640))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return np.expand_dims(img, axis=0)
+
+# =========================
+# PIXEL → WORLD
+# =========================
+def pixel_to_world(cx, cy):
+    pt = np.array([[[cx, cy]]], dtype=np.float32)
+    world = cv2.perspectiveTransform(pt, H)
+
+    X = float(world[0][0][0])
+    Y = float(world[0][0][1])
+
+    return X, Y
+
+# =========================
+# DISTANCE
+# =========================
+def dist(a, b):
+    return float(np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2))
+
+# =========================
+# YOLO DECODER + FUSION
+# =========================
+def parse_detections(outputs, frame):
+
+    global latest
+
+    h, w = frame.shape[:2]
+    pred = np.squeeze(outputs[0])
+
+    if len(pred.shape) == 3:
+        pred = pred[0]
+
+    if pred.shape[0] < pred.shape[1]:
+        pred = pred.T
+
+    objects = []
+
+    for det in pred:
+
+        x, y, bw, bh = det[:4]
+        cls_scores = det[4:]
+
+        cls_id = int(np.argmax(cls_scores))
+        conf = float(cls_scores[cls_id])
+
+        if conf < CONF_THRES:
+            continue
+
+        # normalize fix
+        if x <= 1.5 and y <= 1.5:
+            x *= w
+            y *= h
+            bw *= w
+            bh *= h
+
+        x1 = int(x - bw/2)
+        y1 = int(y - bh/2)
+        x2 = int(x + bw/2)
+        y2 = int(y + bh/2)
+
+        cx = (x1 + x2)//2
+        cy = (y1 + y2)//2
+
+        # WORLD COORDINATES
+        X, Y = pixel_to_world(cx, cy)
+
+        objects.append({
+            "class": classes[cls_id],
+            "confidence": round(conf, 2),
+            "pixel": [cx, cy],
+            "world": [round(X, 2), round(Y, 2)]
+        })
+
+        # DRAW BOX
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+
+        label = f"{classes[cls_id]} {conf:.2f} ({X:.1f},{Y:.1f})"
+
+        cv2.putText(frame,
+                    label,
+                    (x1, y1-5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0,255,0),
+                    2)
+
+    # =========================
+    # DISTANCE BETWEEN OBJECTS
+    # =========================
+    for i in range(len(objects)):
+        for j in range(i+1, len(objects)):
+
+            d = dist(objects[i]["world"], objects[j]["world"])
+
+            cv2.line(frame,
+                     tuple(objects[i]["pixel"]),
+                     tuple(objects[j]["pixel"]),
+                     (255,0,0), 1)
+
+            print(f"{objects[i]['class']} ↔ {objects[j]['class']} = {round(d,2)}")
+
+    latest = objects
+    return objects, frame
+
+# =========================
+# FLASK SERVER
+# =========================
+app = Flask(__name__)
+
+def generate():
+
+    while True:
+
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        inp = preprocess(frame)
+        outputs = session.run(None, {input_name: inp})
+
+        _, frame = parse_detections(outputs, frame)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' +
+               buffer.tobytes() +
+               b'\r\n')
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/")
+def home():
+    return """
+    <h2>YOLO + Homography Clean Output System</h2>
+    <img src="/video" width="800">
+    """
+
+@app.route("/video")
+def video():
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/data")
+def data():
+    return jsonify(latest)
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    print("OPEN: http://<PI_IP>:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
