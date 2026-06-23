@@ -1,0 +1,217 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+import math
+import time
+
+# =========================
+# CONFIG
+# =========================
+CONF_THRES = 0.35
+
+HOMOGRAPHY_PATH = "homography.npy"
+H = np.load(HOMOGRAPHY_PATH)
+
+CHECKERBOARD = (8, 6)
+SQUARE_SIZE_M = 0.025
+BACKGROUND_DISTANCE_M = 2.0
+
+YAW_HOME_DEG = 49.0
+PITCH_HOME_DEG = 55.0
+
+latest = []
+
+# =========================
+# YOLO-WORLD MODEL
+# =========================
+# IMPORTANT: this enables open vocabulary detection
+model = YOLO("yolov8s-world.pt")
+
+PROMPT_CLASSES = [
+    "person",
+    "chair",
+    "table",
+    "sofa",
+    "bottle",
+    "laptop",
+
+    # your key robotic objects
+    "box",
+    "cardboard box",
+    "carton",
+    "package",
+    "parcel",
+    "crate"
+]
+
+model.set_classes(PROMPT_CLASSES)
+
+# =========================
+# TRANSFORMS
+# =========================
+def make_T(R, p):
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = p
+    return T
+
+def setup_transforms():
+    R_WB = np.array([
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 1, 0]
+    ])
+
+    p_WB = np.array([0.0, BACKGROUND_DISTANCE_M, 0.0])
+    T_WB = make_T(R_WB, p_WB)
+
+    return T_WB
+
+T_WB = setup_transforms()
+
+# =========================
+# GEOMETRY
+# =========================
+def pixel_to_background_xy(cx, cy):
+    pt = np.array([[[cx, cy]]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(pt, H)
+    return float(mapped[0][0][0]), float(mapped[0][0][1])
+
+def background_to_world(X, Y):
+    X = X * SQUARE_SIZE_M
+    Y = Y * SQUARE_SIZE_M
+
+    board_w = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
+    board_h = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
+
+    X = board_w - X
+    Y = board_h - Y
+
+    return np.array([X, Y, 0.0, 1.0])
+
+def world_transform(p_B):
+    return T_WB @ p_B
+
+def compute_angles(p_W):
+    x, y, z = p_W[0], p_W[1], p_W[2]
+
+    yaw = math.degrees(math.atan2(x, y))
+    pitch = math.degrees(math.atan2(z, math.sqrt(x*x + y*y)))
+
+    yaw_motor = YAW_HOME_DEG + yaw
+    pitch_motor = PITCH_HOME_DEG + pitch
+
+    return yaw, pitch, yaw_motor, pitch_motor
+
+# =========================
+# CAMERA
+# =========================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# =========================
+# YOLO PROCESSING
+# =========================
+def process(frame):
+    global latest
+
+    results = model(frame, conf=CONF_THRES, verbose=False)
+
+    objects = []
+
+    if len(results) == 0 or results[0].boxes is None:
+        latest = []
+        return objects, frame
+
+    r = results[0]
+
+    for box in r.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+
+        label = model.names[cls_id]
+
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        try:
+            bgX, bgY = pixel_to_background_xy(cx, cy)
+
+            p_B = background_to_world(np.array([bgX, bgY, 0, 1]))
+            p_W = world_transform(p_B)
+
+            yaw, pitch, yaw_m, pitch_m = compute_angles(p_W)
+
+        except:
+            p_W = None
+            yaw = pitch = yaw_m = pitch_m = None
+
+        obj = {
+            "class": label,
+            "confidence": round(conf, 2),
+            "pixel": [cx, cy],
+            "world": None if p_W is None else p_W.tolist(),
+            "yaw": yaw,
+            "pitch": pitch,
+            "motor": [yaw_m, pitch_m]
+        }
+
+        objects.append(obj)
+
+        # draw
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+        cv2.putText(
+            frame,
+            f"{label} {conf:.2f}",
+            (x1, y1-5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0,255,0),
+            2
+        )
+
+    latest = objects
+    return objects, frame
+
+# =========================
+# FLASK SERVER
+# =========================
+app = Flask(__name__)
+
+def stream():
+    while True:
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        _, frame = process(frame)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" +
+               buffer.tobytes() + b"\r\n")
+
+@app.route("/")
+def home():
+    return "<h2>YOLO-World Pipeline</h2><img src='/video'>"
+
+@app.route("/video")
+def video():
+    return Response(stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/data")
+def data():
+    return jsonify(latest)
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    print("Starting YOLO-World Robotics Pipeline...")
+    app.run(host="0.0.0.0", port=5000, debug=False)
