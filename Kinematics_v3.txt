@@ -8,6 +8,11 @@ import time
 import math
 
 # =========================
+#(measures the background distance and has bias based on alignment error/shift)
+# =========================
+
+
+# =========================
 # CONFIG
 # =========================
 MODEL_PATH = "yolov8n.onnx"
@@ -639,8 +644,3 @@ if __name__ == "__main__":
     print("SCAN:      http://<PI_IP>:5000/scan")
 
     app.run(host="0.0.0.0", port=5000, debug=False)
-
-
-
-
-(measures the background distance and has bias based on alignment error/shift)
