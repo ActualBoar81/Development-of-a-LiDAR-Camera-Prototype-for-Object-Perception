@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-import onnxruntime as ort
+from ultralytics import YOLO
 from picamera2 import Picamera2
 from flask import Flask, Response, jsonify
 import serial
@@ -10,37 +10,31 @@ import math
 # =========================
 # CONFIG
 # =========================
-MODEL_PATH = "yolov8n.onnx"
 HOMOGRAPHY_PATH = "homography.npy"
 
-CONF_THRES = 0.25
+CONF_THRES = 0.35
 HOMOGRAPHY_OUTPUT_SCALE_TO_M = 1.0
 
 CHECKERBOARD = (8, 6)
 SQUARE_SIZE_M = 0.025
 
-# Background distance is measured with /calibrate
 BACKGROUND_DISTANCE_M = None
 
-# Updated coordinates in meters
 CAMERA_POS_W_M = np.array([0.0, 0.0, 0.14136])
 LIDAR_POS_W_M = np.array([0.0, 0.0, 0.07316])
 
 YAW_HOME_DEG = 49.0
 PITCH_HOME_DEG = 55.0
 
-# Yaw was reversed
 YAW_SIGN = -1.0
 PITCH_SIGN = 1.0
 
 YAW_SCALE = 1.0
 PITCH_SCALE = 1.0
 
-# Optional bias correction in background frame, meters
 X_BIAS_M = 0.0
 Y_BIAS_M = 0.0
 
-# Multi-object / filter controls
 MULTI_OBJECT_MODE = False
 USE_VALID_OBJECT_FILTER = False
 SCAN_MARGIN_M = 0.03
@@ -61,20 +55,26 @@ T_L0W = None
 H = np.load(HOMOGRAPHY_PATH)
 
 # =========================
-# COCO CLASSES
+# YOLO-WORLD MODEL
 # =========================
-classes = [
-    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
-    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
-    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
-    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
-    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
-    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
-    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
-    "chair","sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop",
-    "mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink",
-    "refrigerator","book","clock","vase","scissors","teddy bear","hair_drier","toothbrush"
+model = YOLO("yolov8s-world.pt")
+
+PROMPT_CLASSES = [
+    "person",
+    "chair",
+    "table",
+    "sofa",
+    "bottle",
+    "laptop",
+    "box",
+    "cardboard box",
+    "carton",
+    "package",
+    "parcel",
+    "crate"
 ]
+
+model.set_classes(PROMPT_CLASSES)
 
 # =========================
 # HOMOGENEOUS TRANSFORMS
@@ -100,10 +100,6 @@ def setup_transforms():
     if BACKGROUND_DISTANCE_M is None:
         raise RuntimeError("Background distance is not calibrated.")
 
-    # Background frame B:
-    # X_B horizontal, Y_B vertical, Z_B = 0 on plane
-    # World frame W:
-    # X_W horizontal, Y_W depth, Z_W vertical
     R_WB = np.array([
         [1, 0, 0],
         [0, 0, 1],
@@ -153,14 +149,11 @@ def send_angle_and_read_distance(yaw_deg, pitch_deg):
     print("[Pi -> Arduino]", command.strip())
     arduino.write(command.encode())
 
-    # Pi waits here until Arduino replies or timeout occurs.
     response = arduino.readline().decode(errors="ignore").strip()
     print("[Arduino -> Pi]", response)
 
     if response.startswith("DIST"):
         distance_raw = float(response.split(",")[1])
-
-        # Arduino sends cm. If Arduino sends mm, use /1000.0.
         return distance_raw / 100.0
 
     return None
@@ -196,7 +189,6 @@ def background_xy_to_background_point(X, Y):
     board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
     board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
 
-    # Correction for current homography/camera orientation
     FLIP_X = True
     FLIP_Y = True
 
@@ -206,11 +198,9 @@ def background_xy_to_background_point(X, Y):
     if FLIP_Y:
         Y = board_height - Y
 
-    # Convert bottom-left origin to board-center origin
     x_B = X - board_width / 2.0
     y_B = Y - board_height / 2.0
 
-    # Optional experimental bias
     x_B += X_BIAS_M
     y_B += Y_BIAS_M
 
@@ -271,26 +261,11 @@ def reconstruct_object_point_world(distance_m, yaw_kin_deg, pitch_kin_deg):
 
 
 # =========================
-# MODEL
-# =========================
-session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
-
-# =========================
 # CAMERA
 # =========================
 picam2 = Picamera2()
 picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
 picam2.start()
-
-# =========================
-# PREPROCESS
-# =========================
-def preprocess(frame):
-    img = cv2.resize(frame, (640, 640))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return np.expand_dims(img, axis=0)
 
 
 # =========================
@@ -347,7 +322,6 @@ def get_scan_order(objects):
             if obj["p_B_m"] is not None
         ]
 
-    # Efficient basic order: left → right.
     ordered = sorted(
         valid_objects,
         key=lambda obj: obj["p_B_m"][0]
@@ -357,42 +331,28 @@ def get_scan_order(objects):
 
 
 # =========================
-# YOLO DECODER
+# YOLO-WORLD PROCESSING
 # =========================
-def parse_detections(outputs, frame):
+def process(frame):
     global latest
 
-    h, w = frame.shape[:2]
-    pred = np.squeeze(outputs[0])
-
-    if len(pred.shape) == 3:
-        pred = pred[0]
-
-    if pred.shape[0] < pred.shape[1]:
-        pred = pred.T
-
+    results = model(frame, conf=CONF_THRES, verbose=False)
     objects = []
 
-    for det in pred:
-        x, y, bw, bh = det[:4]
-        cls_scores = det[4:]
+    if len(results) == 0 or results[0].boxes is None:
+        latest = []
+        return objects, frame
 
-        cls_id = int(np.argmax(cls_scores))
-        conf = float(cls_scores[cls_id])
+    r = results[0]
 
-        if conf < CONF_THRES:
-            continue
+    for box in r.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
 
-        if x <= 1.5 and y <= 1.5:
-            x *= w
-            y *= h
-            bw *= w
-            bh *= h
+        label = model.names[cls_id]
 
-        x1 = int(x - bw / 2)
-        y1 = int(y - bh / 2)
-        x2 = int(x + bw / 2)
-        y2 = int(y + bh / 2)
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
@@ -417,7 +377,7 @@ def parse_detections(outputs, frame):
             yaw_motor, pitch_motor = None, None
 
         obj = {
-            "class": classes[cls_id],
+            "class": label,
             "confidence": round(conf, 2),
             "pixel": [cx, cy],
             "homography_background_raw": [bg_X_raw, bg_Y_raw],
@@ -434,17 +394,16 @@ def parse_detections(outputs, frame):
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         if p_W is not None:
-            label = (
-                f"{classes[cls_id]} {conf:.2f} "
-                f"W({p_W[0]:.2f},{p_W[1]:.2f},{p_W[2]:.2f}) "
+            draw_label = (
+                f"{label} {conf:.2f} "
                 f"Y:{yaw_motor:.1f} P:{pitch_motor:.1f}"
             )
         else:
-            label = f"{classes[cls_id]} {conf:.2f} - run /calibrate"
+            draw_label = f"{label} {conf:.2f} - run /calibrate"
 
         cv2.putText(
             frame,
-            label,
+            draw_label,
             (x1, y1 - 5),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
@@ -489,10 +448,7 @@ def generate():
         frame = picam2.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        inp = preprocess(frame)
-        outputs = session.run(None, {input_name: inp})
-
-        _, frame = parse_detections(outputs, frame)
+        _, frame = process(frame)
 
         _, buffer = cv2.imencode(".jpg", frame)
 
@@ -504,13 +460,10 @@ def generate():
         )
 
 
-# =========================
-# ROUTES
-# =========================
 @app.route("/")
 def home():
     return """
-    <h2>YOLO + Homography + Full Kinematics + Auto Background Calibration</h2>
+    <h2>YOLO-World + Homography + Full Kinematics</h2>
     <p>1. Remove object from background.</p>
     <p>2. Open <a href="/calibrate">/calibrate</a>.</p>
     <p>3. Place object.</p>
@@ -541,6 +494,7 @@ def data():
             "x": X_BIAS_M,
             "y": Y_BIAS_M
         },
+        "prompt_classes": PROMPT_CLASSES,
         "latest": latest
     })
 
@@ -640,16 +594,13 @@ def scan():
             "object_index": index,
             "object": obj["class"],
             "confidence": obj["confidence"],
-
             "aim_point_background_m": obj["p_B_m"],
             "aim_point_world_m": p_W.tolist(),
             "aim_point_lidar_home_m": p_L0.tolist(),
-
             "yaw_kinematic_deg": yaw_kin,
             "pitch_kinematic_deg": pitch_kin,
             "yaw_motor_deg": yaw_motor,
             "pitch_motor_deg": pitch_motor,
-
             "distance_m": distance_m,
             "reconstructed_object_world_m": p_obj_W
         })
@@ -671,10 +622,11 @@ def scan():
 # RUN
 # =========================
 if __name__ == "__main__":
-    print("Starting YOLO + Homography + Full Kinematics system...")
+    print("Starting YOLO-World + Homography + Full Kinematics system...")
     print("Camera position W:", CAMERA_POS_W_M)
     print("LiDAR position W:", LIDAR_POS_W_M)
     print("Bias X/Y:", X_BIAS_M, Y_BIAS_M)
+    print("Prompt classes:", PROMPT_CLASSES)
 
     init_arduino()
 
