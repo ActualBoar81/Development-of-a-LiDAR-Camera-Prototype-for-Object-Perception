@@ -1,0 +1,689 @@
+import cv2
+import numpy as np
+import onnxruntime as ort
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+import serial
+import time
+import math
+
+# =========================
+# CONFIG
+# =========================
+MODEL_PATH = "yolov8n.onnx"
+HOMOGRAPHY_PATH = "homography.npy"
+
+CONF_THRES = 0.25
+HOMOGRAPHY_OUTPUT_SCALE_TO_M = 1.0
+
+CHECKERBOARD = (8, 6)
+SQUARE_SIZE_M = 0.025
+
+# Background distance is measured with /calibrate
+BACKGROUND_DISTANCE_M = None
+
+# Updated coordinates in meters
+CAMERA_POS_W_M = np.array([0.0, 0.0, 0.14136])
+LIDAR_POS_W_M = np.array([0.0, 0.0, 0.07316])
+
+YAW_HOME_DEG = 49.0
+PITCH_HOME_DEG = 55.0
+
+# Yaw was reversed
+YAW_SIGN = -1.0
+PITCH_SIGN = 1.0
+
+YAW_SCALE = 1.0
+PITCH_SCALE = 1.0
+
+# Optional bias correction in background frame, meters
+X_BIAS_M = 0.0
+Y_BIAS_M = 0.0
+
+# Multi-object / filter controls
+MULTI_OBJECT_MODE = False
+USE_VALID_OBJECT_FILTER = False
+SCAN_MARGIN_M = 0.03
+
+ARDUINO_PORT = "/dev/ttyUSB0"
+BAUDRATE = 115200
+
+latest = []
+arduino = None
+
+T_WB = None
+T_WL0 = None
+T_L0W = None
+
+# =========================
+# LOAD HOMOGRAPHY
+# =========================
+H = np.load(HOMOGRAPHY_PATH)
+
+# =========================
+# COCO CLASSES
+# =========================
+classes = [
+    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
+    "chair","sofa","pottedplant","bed","diningtable","toilet","tvmonitor","laptop",
+    "mouse","remote","keyboard","cell phone","microwave","oven","toaster","sink",
+    "refrigerator","book","clock","vase","scissors","teddy bear","hair_drier","toothbrush"
+]
+
+# =========================
+# HOMOGENEOUS TRANSFORMS
+# =========================
+def make_T(R, p):
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = p
+    return T
+
+
+def inv_T(T):
+    R = T[:3, :3]
+    p = T[:3, 3]
+
+    T_inv = np.eye(4)
+    T_inv[:3, :3] = R.T
+    T_inv[:3, 3] = -R.T @ p
+    return T_inv
+
+
+def setup_transforms():
+    if BACKGROUND_DISTANCE_M is None:
+        raise RuntimeError("Background distance is not calibrated.")
+
+    # Background frame B:
+    # X_B horizontal, Y_B vertical, Z_B = 0 on plane
+    # World frame W:
+    # X_W horizontal, Y_W depth, Z_W vertical
+    R_WB = np.array([
+        [1, 0, 0],
+        [0, 0, 1],
+        [0, 1, 0]
+    ])
+
+    p_WB = np.array([0.0, BACKGROUND_DISTANCE_M, 0.0])
+    T_WB_local = make_T(R_WB, p_WB)
+
+    R_WL0 = np.eye(3)
+    T_WL0_local = make_T(R_WL0, LIDAR_POS_W_M)
+
+    return T_WB_local, T_WL0_local
+
+
+def update_transforms_with_background_distance(background_distance_m):
+    global BACKGROUND_DISTANCE_M, T_WB, T_WL0, T_L0W
+
+    BACKGROUND_DISTANCE_M = background_distance_m
+    T_WB, T_WL0 = setup_transforms()
+    T_L0W = inv_T(T_WL0)
+
+    print(f"[System] Background distance updated: {BACKGROUND_DISTANCE_M:.3f} m")
+
+
+# =========================
+# ARDUINO
+# =========================
+def init_arduino():
+    global arduino
+
+    arduino = serial.Serial(ARDUINO_PORT, BAUDRATE, timeout=2)
+    time.sleep(2)
+
+    ready = arduino.readline().decode(errors="ignore").strip()
+    print("[Arduino]", ready)
+
+
+def send_angle_and_read_distance(yaw_deg, pitch_deg):
+    if arduino is None:
+        return None
+
+    yaw_i = round(yaw_deg)
+    pitch_i = round(pitch_deg)
+
+    command = f"ANGLE,{yaw_i},{pitch_i}\n"
+    print("[Pi -> Arduino]", command.strip())
+    arduino.write(command.encode())
+
+    # Pi waits here until Arduino replies or timeout occurs.
+    response = arduino.readline().decode(errors="ignore").strip()
+    print("[Arduino -> Pi]", response)
+
+    if response.startswith("DIST"):
+        distance_raw = float(response.split(",")[1])
+
+        # Arduino sends cm. If Arduino sends mm, use /1000.0.
+        return distance_raw / 100.0
+
+    return None
+
+
+def calibrate_background_distance():
+    print("[System] Calibrating background distance...")
+    print("[System] Moving to home position...")
+
+    distance_m = send_angle_and_read_distance(
+        YAW_HOME_DEG,
+        PITCH_HOME_DEG
+    )
+
+    if distance_m is None:
+        raise RuntimeError("Could not read background distance from Arduino.")
+
+    update_transforms_with_background_distance(distance_m)
+    return distance_m
+
+
+# =========================
+# KINEMATICS
+# =========================
+def clamp(v, vmin, vmax):
+    return max(vmin, min(vmax, v))
+
+
+def background_xy_to_background_point(X, Y):
+    X = X * HOMOGRAPHY_OUTPUT_SCALE_TO_M
+    Y = Y * HOMOGRAPHY_OUTPUT_SCALE_TO_M
+
+    board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
+    board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
+
+    # Correction for current homography/camera orientation
+    FLIP_X = True
+    FLIP_Y = True
+
+    if FLIP_X:
+        X = board_width - X
+
+    if FLIP_Y:
+        Y = board_height - Y
+
+    # Convert bottom-left origin to board-center origin
+    x_B = X - board_width / 2.0
+    y_B = Y - board_height / 2.0
+
+    # Optional experimental bias
+    x_B += X_BIAS_M
+    y_B += Y_BIAS_M
+
+    return np.array([x_B, y_B, 0.0, 1.0])
+
+
+def background_point_to_world(p_B):
+    if T_WB is None:
+        raise RuntimeError("Transforms are not initialized. Run /calibrate first.")
+    return T_WB @ p_B
+
+
+def calculate_yaw_pitch_from_world_point(p_W):
+    if T_L0W is None:
+        raise RuntimeError("Transforms are not initialized. Run /calibrate first.")
+
+    p_L0 = T_L0W @ p_W
+
+    x = p_L0[0]
+    y = p_L0[1]
+    z = p_L0[2]
+
+    yaw_rad = math.atan2(x, y)
+    pitch_rad = math.atan2(z, math.sqrt(x**2 + y**2))
+
+    return math.degrees(yaw_rad), math.degrees(pitch_rad), p_L0
+
+
+def map_to_motor_angles(yaw_kin_deg, pitch_kin_deg):
+    yaw_motor = YAW_HOME_DEG + YAW_SIGN * YAW_SCALE * yaw_kin_deg
+    pitch_motor = PITCH_HOME_DEG + PITCH_SIGN * PITCH_SCALE * pitch_kin_deg
+
+    yaw_motor = clamp(yaw_motor, 0, 180)
+    pitch_motor = clamp(pitch_motor, 0, 180)
+
+    return yaw_motor, pitch_motor
+
+
+def reconstruct_object_point_world(distance_m, yaw_kin_deg, pitch_kin_deg):
+    yaw = math.radians(yaw_kin_deg)
+    pitch = math.radians(pitch_kin_deg)
+
+    beam_L0 = np.array([
+        math.sin(yaw) * math.cos(pitch),
+        math.cos(yaw) * math.cos(pitch),
+        math.sin(pitch)
+    ])
+
+    p_obj_L0 = np.array([
+        distance_m * beam_L0[0],
+        distance_m * beam_L0[1],
+        distance_m * beam_L0[2],
+        1.0
+    ])
+
+    p_obj_W = T_WL0 @ p_obj_L0
+    return p_obj_W.tolist()
+
+
+# =========================
+# MODEL
+# =========================
+session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+# =========================
+# CAMERA
+# =========================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# =========================
+# PREPROCESS
+# =========================
+def preprocess(frame):
+    img = cv2.resize(frame, (640, 640))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return np.expand_dims(img, axis=0)
+
+
+# =========================
+# PIXEL → BACKGROUND
+# =========================
+def pixel_to_background_xy(cx, cy):
+    pt = np.array([[[cx, cy]]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(pt, H)
+
+    X = float(mapped[0][0][0])
+    Y = float(mapped[0][0][1])
+
+    return X, Y
+
+
+def dist(a, b):
+    return float(np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2))
+
+
+# =========================
+# MULTI-OBJECT SCAN HELPERS
+# =========================
+def is_valid_object_for_scan(obj):
+    if obj["p_B_m"] is None:
+        return False
+
+    x_B = obj["p_B_m"][0]
+    y_B = obj["p_B_m"][1]
+
+    board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
+    board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
+
+    if x_B < -board_width / 2.0 - SCAN_MARGIN_M:
+        return False
+    if x_B > board_width / 2.0 + SCAN_MARGIN_M:
+        return False
+    if y_B < -board_height / 2.0 - SCAN_MARGIN_M:
+        return False
+    if y_B > board_height / 2.0 + SCAN_MARGIN_M:
+        return False
+
+    return True
+
+
+def get_scan_order(objects):
+    if USE_VALID_OBJECT_FILTER:
+        valid_objects = [
+            obj for obj in objects
+            if is_valid_object_for_scan(obj)
+        ]
+    else:
+        valid_objects = [
+            obj for obj in objects
+            if obj["p_B_m"] is not None
+        ]
+
+    # Efficient basic order: left → right.
+    ordered = sorted(
+        valid_objects,
+        key=lambda obj: obj["p_B_m"][0]
+    )
+
+    return ordered
+
+
+# =========================
+# YOLO DECODER
+# =========================
+def parse_detections(outputs, frame):
+    global latest
+
+    h, w = frame.shape[:2]
+    pred = np.squeeze(outputs[0])
+
+    if len(pred.shape) == 3:
+        pred = pred[0]
+
+    if pred.shape[0] < pred.shape[1]:
+        pred = pred.T
+
+    objects = []
+
+    for det in pred:
+        x, y, bw, bh = det[:4]
+        cls_scores = det[4:]
+
+        cls_id = int(np.argmax(cls_scores))
+        conf = float(cls_scores[cls_id])
+
+        if conf < CONF_THRES:
+            continue
+
+        if x <= 1.5 and y <= 1.5:
+            x *= w
+            y *= h
+            bw *= w
+            bh *= h
+
+        x1 = int(x - bw / 2)
+        y1 = int(y - bh / 2)
+        x2 = int(x + bw / 2)
+        y2 = int(y + bh / 2)
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        try:
+            bg_X_raw, bg_Y_raw = pixel_to_background_xy(cx, cy)
+            p_B = background_xy_to_background_point(bg_X_raw, bg_Y_raw)
+
+            if BACKGROUND_DISTANCE_M is not None:
+                p_W = background_point_to_world(p_B)
+                yaw_kin, pitch_kin, p_L0 = calculate_yaw_pitch_from_world_point(p_W)
+                yaw_motor, pitch_motor = map_to_motor_angles(yaw_kin, pitch_kin)
+            else:
+                p_W, p_L0 = None, None
+                yaw_kin, pitch_kin = None, None
+                yaw_motor, pitch_motor = None, None
+
+        except Exception:
+            bg_X_raw, bg_Y_raw = None, None
+            p_B, p_W, p_L0 = None, None, None
+            yaw_kin, pitch_kin = None, None
+            yaw_motor, pitch_motor = None, None
+
+        obj = {
+            "class": classes[cls_id],
+            "confidence": round(conf, 2),
+            "pixel": [cx, cy],
+            "homography_background_raw": [bg_X_raw, bg_Y_raw],
+            "p_B_m": None if p_B is None else p_B.tolist(),
+            "p_W_m": None if p_W is None else p_W.tolist(),
+            "p_L0_m": None if p_L0 is None else p_L0.tolist(),
+            "yaw_kinematic_deg": yaw_kin,
+            "pitch_kinematic_deg": pitch_kin,
+            "motor_preview_deg": [yaw_motor, pitch_motor]
+        }
+
+        objects.append(obj)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        if p_W is not None:
+            label = (
+                f"{classes[cls_id]} {conf:.2f} "
+                f"W({p_W[0]:.2f},{p_W[1]:.2f},{p_W[2]:.2f}) "
+                f"Y:{yaw_motor:.1f} P:{pitch_motor:.1f}"
+            )
+        else:
+            label = f"{classes[cls_id]} {conf:.2f} - run /calibrate"
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 255, 0),
+            2
+        )
+
+    for i in range(len(objects)):
+        for j in range(i + 1, len(objects)):
+            a = objects[i]["p_B_m"]
+            b = objects[j]["p_B_m"]
+
+            if a is None or b is None:
+                continue
+
+            d = dist([a[0], a[1]], [b[0], b[1]])
+
+            cv2.line(
+                frame,
+                tuple(objects[i]["pixel"]),
+                tuple(objects[j]["pixel"]),
+                (255, 0, 0),
+                1
+            )
+
+            print(
+                f"{objects[i]['class']} ↔ {objects[j]['class']} "
+                f"= {round(d, 3)} m on background plane"
+            )
+
+    latest = objects
+    return objects, frame
+
+
+# =========================
+# FLASK SERVER
+# =========================
+app = Flask(__name__)
+
+def generate():
+    while True:
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        inp = preprocess(frame)
+        outputs = session.run(None, {input_name: inp})
+
+        _, frame = parse_detections(outputs, frame)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            buffer.tobytes() +
+            b"\r\n"
+        )
+
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/")
+def home():
+    return """
+    <h2>YOLO + Homography + Full Kinematics + Auto Background Calibration</h2>
+    <p>1. Remove object from background.</p>
+    <p>2. Open <a href="/calibrate">/calibrate</a>.</p>
+    <p>3. Place object.</p>
+    <p>4. Open <a href="/scan">/scan</a>.</p>
+    <p>Toggle multi-object mode: <a href="/toggle_multi">/toggle_multi</a></p>
+    <p>Toggle valid-object filter: <a href="/toggle_filter">/toggle_filter</a></p>
+    <p>Video: <a href="/video">/video</a></p>
+    <p>Data: <a href="/data">/data</a></p>
+    <img src="/video" width="800">
+    """
+
+
+@app.route("/video")
+def video():
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/data")
+def data():
+    return jsonify({
+        "background_distance_m": BACKGROUND_DISTANCE_M,
+        "multi_object_mode": MULTI_OBJECT_MODE,
+        "use_valid_object_filter": USE_VALID_OBJECT_FILTER,
+        "bias_m": {
+            "x": X_BIAS_M,
+            "y": Y_BIAS_M
+        },
+        "latest": latest
+    })
+
+
+@app.route("/toggle_multi")
+def toggle_multi():
+    global MULTI_OBJECT_MODE
+
+    MULTI_OBJECT_MODE = not MULTI_OBJECT_MODE
+
+    return jsonify({
+        "multi_object_mode": MULTI_OBJECT_MODE
+    })
+
+
+@app.route("/toggle_filter")
+def toggle_filter():
+    global USE_VALID_OBJECT_FILTER
+
+    USE_VALID_OBJECT_FILTER = not USE_VALID_OBJECT_FILTER
+
+    return jsonify({
+        "use_valid_object_filter": USE_VALID_OBJECT_FILTER,
+        "scan_margin_m": SCAN_MARGIN_M
+    })
+
+
+@app.route("/calibrate")
+def calibrate():
+    try:
+        distance_m = calibrate_background_distance()
+
+        return jsonify({
+            "status": "calibrated",
+            "background_distance_m": distance_m,
+            "home_yaw_deg": YAW_HOME_DEG,
+            "home_pitch_deg": PITCH_HOME_DEG
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/scan")
+def scan():
+    if BACKGROUND_DISTANCE_M is None:
+        return jsonify({
+            "error": "Background distance is not calibrated. Open /calibrate first."
+        })
+
+    if len(latest) == 0:
+        return jsonify({"error": "No object detected"})
+
+    if MULTI_OBJECT_MODE:
+        objects_to_scan = get_scan_order(latest)
+    else:
+        objects_to_scan = [latest[0]]
+
+    if len(objects_to_scan) == 0:
+        return jsonify({
+            "error": "No valid object available for scan.",
+            "multi_object_mode": MULTI_OBJECT_MODE,
+            "use_valid_object_filter": USE_VALID_OBJECT_FILTER
+        })
+
+    scan_results = []
+
+    for index, obj in enumerate(objects_to_scan, start=1):
+        if obj["p_W_m"] is None:
+            scan_results.append({
+                "object_index": index,
+                "error": "No valid world coordinate"
+            })
+            continue
+
+        p_W = np.array(obj["p_W_m"])
+
+        yaw_kin, pitch_kin, p_L0 = calculate_yaw_pitch_from_world_point(p_W)
+        yaw_motor, pitch_motor = map_to_motor_angles(yaw_kin, pitch_kin)
+
+        distance_m = send_angle_and_read_distance(yaw_motor, pitch_motor)
+
+        if distance_m is None:
+            scan_results.append({
+                "object_index": index,
+                "error": "No valid distance received from Arduino"
+            })
+            continue
+
+        p_obj_W = reconstruct_object_point_world(
+            distance_m,
+            yaw_kin,
+            pitch_kin
+        )
+
+        scan_results.append({
+            "object_index": index,
+            "object": obj["class"],
+            "confidence": obj["confidence"],
+
+            "aim_point_background_m": obj["p_B_m"],
+            "aim_point_world_m": p_W.tolist(),
+            "aim_point_lidar_home_m": p_L0.tolist(),
+
+            "yaw_kinematic_deg": yaw_kin,
+            "pitch_kinematic_deg": pitch_kin,
+            "yaw_motor_deg": yaw_motor,
+            "pitch_motor_deg": pitch_motor,
+
+            "distance_m": distance_m,
+            "reconstructed_object_world_m": p_obj_W
+        })
+
+    return jsonify({
+        "scan_mode": "multi_object_ordered" if MULTI_OBJECT_MODE else "single_object_once",
+        "multi_object_mode": MULTI_OBJECT_MODE,
+        "use_valid_object_filter": USE_VALID_OBJECT_FILTER,
+        "background_distance_m": BACKGROUND_DISTANCE_M,
+        "bias_m": {
+            "x": X_BIAS_M,
+            "y": Y_BIAS_M
+        },
+        "results": scan_results
+    })
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    print("Starting YOLO + Homography + Full Kinematics system...")
+    print("Camera position W:", CAMERA_POS_W_M)
+    print("LiDAR position W:", LIDAR_POS_W_M)
+    print("Bias X/Y:", X_BIAS_M, Y_BIAS_M)
+
+    init_arduino()
+
+    print("OPEN:          http://<PI_IP>:5000")
+    print("CALIBRATE:     http://<PI_IP>:5000/calibrate")
+    print("VIDEO:         http://<PI_IP>:5000/video")
+    print("DATA:          http://<PI_IP>:5000/data")
+    print("SCAN:          http://<PI_IP>:5000/scan")
+    print("TOGGLE MULTI:  http://<PI_IP>:5000/toggle_multi")
+    print("TOGGLE FILTER: http://<PI_IP>:5000/toggle_filter")
+
+    app.run(host="0.0.0.0", port=5000, debug=False)
