@@ -589,22 +589,20 @@ def calibrate():
 
 @app.route("/scan")
 def scan():
-    if BACKGROUND_DISTANCE_M is None:
-        return jsonify({
-            "error": "Background distance is not calibrated. Open /calibrate first."
-        })
+if MULTI_OBJECT_MODE:
+    objects_to_scan = get_scan_order(latest)
+    scan_source = "current_multi_object_ordered"
 
-    if LATCHED_TARGET is not None:
-        objects_to_scan = [LATCHED_TARGET]
-        scan_source = "latched_target"
-    elif MULTI_OBJECT_MODE:
-        objects_to_scan = get_scan_order(latest)
-        scan_source = "current_multi_object_ordered"
-    else:
-        if len(latest) == 0:
-            return jsonify({"error": "No object detected and no latched target saved."})
-        objects_to_scan = [latest[0]]
-        scan_source = "current_single_object"
+elif LATCH_ENABLED and LATCHED_TARGET is not None:
+    objects_to_scan = [LATCHED_TARGET]
+    scan_source = "latched_target"
+
+else:
+    if len(latest) == 0:
+        return jsonify({"error": "No object detected."})
+
+    objects_to_scan = [latest[0]]
+    scan_source = "current_single_object"
 
     if len(objects_to_scan) == 0:
         return jsonify({
