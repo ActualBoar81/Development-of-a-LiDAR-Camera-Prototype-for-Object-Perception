@@ -15,7 +15,7 @@ HOMOGRAPHY_PATH = "homography.npy"
 CONF_THRES = 0.35
 HOMOGRAPHY_OUTPUT_SCALE_TO_M = 1.0
 
-CHECKERBOARD = (8, 6)
+CHECKERBOARD = (46, 32)
 SQUARE_SIZE_M = 0.025
 
 BACKGROUND_DISTANCE_M = None
@@ -189,8 +189,8 @@ def background_xy_to_background_point(X, Y):
     board_width = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
     board_height = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
 
-    FLIP_X = True
-    FLIP_Y = True
+    FLIP_X = False
+    FLIP_Y = False
 
     if FLIP_X:
         X = board_width - X
