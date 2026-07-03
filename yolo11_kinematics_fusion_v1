@@ -1,0 +1,182 @@
+import cv2
+import numpy as np
+import time
+from ultralytics import YOLO
+from picamera2 import Picamera2
+from flask import Flask, Response, jsonify
+
+# =========================
+# CONFIG
+# =========================
+HOMOGRAPHY_PATH = "homography.npy"
+CONF_THRES = 0.35
+
+CHECKERBOARD = (46, 32)
+SQUARE_SIZE_M = 0.025
+
+AIM_X_fraction = 0.65
+AIM_Y_fraction = 0.50
+
+latest = []
+LATCHED_TARGET = None
+
+# OPTIONAL: put your class names here if needed
+CUSTOM_NAMES = None   # or: {0:"box", 1:"carton"}
+
+# =========================
+# LOAD HOMOGRAPHY
+# =========================
+H = np.load(HOMOGRAPHY_PATH)
+
+# =========================
+# YOLO11 MODEL
+# =========================
+model = YOLO("best.pt")
+
+print("[INFO] Model loaded")
+print("[INFO] Classes:", model.names)
+
+# =========================
+# CAMERA
+# =========================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.start()
+
+# =========================
+# UTILS
+# =========================
+def pixel_to_background_xy(cx, cy):
+    pt = np.array([[[cx, cy]]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(pt, H)
+    return float(mapped[0][0][0]), float(mapped[0][0][1])
+
+
+def background_xy_to_point(X, Y):
+    board_w = (CHECKERBOARD[0] - 1) * SQUARE_SIZE_M
+    board_h = (CHECKERBOARD[1] - 1) * SQUARE_SIZE_M
+
+    x_B = X - board_w / 2.0
+    y_B = Y - board_h / 2.0
+
+    return [x_B, y_B, 0.0]
+
+
+# =========================
+# PROCESS FRAME
+# =========================
+def process(frame):
+    global latest
+
+    results = model(frame, conf=CONF_THRES, verbose=False)
+    objects = []
+
+    if not results or results[0].boxes is None:
+        latest = []
+        return objects, frame
+
+    r = results[0]
+
+    for box in r.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+
+        # SAFE tracking ID (only exists if tracking enabled)
+        track_id = -1
+
+        # correct class name
+        class_name = model.names[int(cls_id)]
+
+        if class_name == "0":
+            class_name = "box"
+
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+
+        cx = int(x1 + AIM_X_fraction * (x2 - x1))
+        cy = int(y1 + AIM_Y_fraction * (y2 - y1))
+
+        try:
+            bg_x, bg_y = pixel_to_background_xy(cx, cy)
+            p_B = background_xy_to_point(bg_x, bg_y)
+        except:
+            p_B = None
+
+        obj = {
+            "class": class_name,
+            "confidence": round(conf, 2),
+            "pixel": [cx, cy],
+            "p_B": p_B
+        }
+
+        objects.append(obj)
+
+        # draw box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        label = f"{class_name} {conf:.2f}"
+        if track_id != -1:
+            label = f"ID {track_id} | {label}"
+
+        if p_B is None:
+            label += " (no homography)"
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    latest = objects
+    return objects, frame
+
+
+# =========================
+# FLASK
+# =========================
+app = Flask(__name__)
+
+def generate():
+    while True:
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = cv2.flip(frame, -1)
+
+        _, frame = process(frame)
+
+        _, buffer = cv2.imencode(".jpg", frame)
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" +
+               buffer.tobytes() + b"\r\n")
+
+
+@app.route("/")
+def home():
+    return """
+    <h2>YOLO11 Detection (Fixed)</h2>
+    <img src="/video" width="800">
+    """
+
+
+@app.route("/video")
+def video():
+    return Response(generate(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/data")
+def data():
+    return jsonify({"latest": latest})
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    print("Starting YOLO11 Flask system...")
+    app.run(host="0.0.0.0", port=5000, debug=False)
