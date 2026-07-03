@@ -26,7 +26,7 @@ LIDAR_POS_W_M = np.array([0.0, 0.0, 0.07316])
 
 AIM_X_fraction = 0.65
 AIM_Y_fraction = 0.50
-a
+
 YAW_HOME_DEG = 49.0
 PITCH_HOME_DEG = 55.0
 
