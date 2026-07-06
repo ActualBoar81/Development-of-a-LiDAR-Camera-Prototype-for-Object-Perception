@@ -25,7 +25,7 @@ BACKGROUND_DISTANCE_STEP_M = 0.05  # manual adjustment step, meters
 CAMERA_POS_W_M = np.array([0.0, 0.0, 0.14136])
 LIDAR_POS_W_M = np.array([0.0, 0.0, 0.07316])
 
-AIM_X_fraction = 0.65
+AIM_X_fraction = 0.5
 AIM_Y_fraction = 0.50
 
 YAW_HOME_DEG = 49.0
