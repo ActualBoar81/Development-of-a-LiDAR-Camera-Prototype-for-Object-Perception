@@ -458,9 +458,12 @@ def process(frame):
 
     latest = objects
 
-    if LATCH_ENABLED:
+   if LATCH_ENABLED and len(objects) > 0:
+    if MULTI_OBJECT_MODE:
         for obj in objects:
             save_latched_target(obj)
+    else:
+        save_latched_target(objects[0])
 
     return objects, frame
 
