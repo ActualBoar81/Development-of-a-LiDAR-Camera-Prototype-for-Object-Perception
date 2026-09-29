@@ -1,0 +1,108 @@
+# ENVIRONMENT INFO
+
+## Master Project
+
+# Development of a LiDAR–Camera Prototype for Object Perception
+
+## Final camera application
+
+Main script:
+Master_Project_Main_Code.py
+
+Hardware:
+Raspberry Pi 5 (8 GB)
+Raspberry Pi Camera Module 3
+
+Python:
+Python 3.13.5
+
+Python virtual environment:
+/home/lidarproject/yolo8_project/venv/
+
+## Required Python dependencies
+
+Install the following packages in the Python environment:
+
+```
+ultralytics==8.4.75
+numpy==2.2.4
+opencv-python==4.13.0.92
+Flask==3.1.1
+```
+
+## Raspberry Pi system dependency
+
+Picamera2 is required for camera access.
+
+Picamera2 is provided by the Raspberry Pi OS system packages rather than
+installed as a normal pip package.
+
+Required system components include:
+
+```
+python3-picamera2
+python3-libcamera
+libcamera / rpicam camera stack
+```
+
+## Python standard-library modules
+
+The final script also uses:
+
+```
+time
+```
+
+No separate installation is required for this module because it is part of
+Python.
+
+## Final model and project files
+
+The final application also requires the project files used by the runtime,
+including:
+
+```
+best.pt
+homography.npy
+```
+
+and, where used by the final implementation:
+
+```
+camera_matrix.npy
+dist_coeffs.npy
+```
+
+## Installation summary
+
+On a Raspberry Pi with the camera system already configured:
+
+1. Install Python 3.13.5.
+2. Create/activate a Python virtual environment.
+3. Install the Python packages listed above.
+4. Ensure Picamera2 and the Raspberry Pi camera/libcamera system packages
+   are installed.
+5. Place the required model and calibration files in the expected project
+   locations.
+6. Run:
+
+   python3 Master_Project_Main_Code.py
+
+## Important
+
+The following packages are NOT required to run the final
+application:
+
+```
+pyserial
+onnxruntime
+torch
+torchvision
+timm
+open_clip_torch
+clip
+YOLO-World-related packages
+```
+
+These were used for other integrated or experimental versions of the project
+and are not required for the final camera detection script.

@@ -1,0 +1,16 @@
+# Final direct Python dependencies for the camera-based YOLO11n application
+# Python version verified on the Raspberry Pi: 3.13.5
+#
+# Direct imports of yolo11_box_detection.py:
+#   cv2, numpy, time, ultralytics, picamera2, flask
+#
+# Picamera2 is supplied by Raspberry Pi OS and is therefore intentionally NOT
+# listed as a pip dependency here.
+#
+# pyserial is installed in the project environment for integrated hardware
+# communication, but is not directly imported by the camera-only final script.
+
+ultralytics==8.4.75
+numpy==2.2.4
+opencv-python==4.13.0.92
+Flask==3.1.1
